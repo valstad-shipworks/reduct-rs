@@ -36,8 +36,10 @@ async-stream = "0.3.5"
 async-channel = "2.1.1"
 tokio = { version = "1.0", default-features = false, features = ["macros"] }
 
+# The streaming read protocol is not released yet, so the base crate shared with the
+# server comes from the fork that defines it.
 [patch."https://github.com/reductstore/reductstore.git"]
-reduct-base = { path = "../reductstore/reduct_base" }
+reduct-base = { git = "https://github.com/valstad-shipworks/reductstore.git", branch = "stream-based-reader" }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util", "rt-multi-thread"] }
