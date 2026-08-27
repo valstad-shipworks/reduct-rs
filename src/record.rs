@@ -5,6 +5,7 @@
 
 pub mod query;
 pub mod read_record;
+pub(crate) mod read_stream;
 pub mod remove_record;
 pub mod update_record;
 pub mod write_batched_records_v1;
@@ -60,7 +61,7 @@ impl Record {
     }
 
     /// Entry name of the record
-    pub(crate) fn entry(&self) -> &str {
+    pub fn entry(&self) -> &str {
         &self.entry
     }
 

@@ -7,6 +7,7 @@ use crate::bucket::BucketBuilder;
 use crate::http_client::HttpClient;
 use crate::replication::ReplicationBuilder;
 use crate::Bucket;
+use reduct_base::batch::v3::READ_STREAM_FEATURE;
 use reduct_base::error::{ErrorCode, ReductError};
 use reduct_base::msg::replication_api::{
     FullReplicationInfo, ReplicationInfo, ReplicationList, ReplicationMode, ReplicationModePayload,
@@ -189,6 +190,16 @@ impl ReductClient {
     /// Get the API token.
     pub fn api_token(&self) -> &str {
         self.http_client.api_token()
+    }
+
+    /// Check whether the server answers a query with one streamed response instead of
+    /// one response per batch.
+    ///
+    /// # Returns
+    ///
+    /// Whether the server streams reads, or `None` if no response has been seen yet.
+    pub async fn supports_streaming_reads(&self) -> Option<bool> {
+        self.http_client.supports(READ_STREAM_FEATURE).await
     }
 
     /// Get the server info.

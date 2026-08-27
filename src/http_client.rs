@@ -4,9 +4,11 @@
 //    file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::client::{Result, API_BASE};
+use reduct_base::batch::API_FEATURES_HEADER;
 use reduct_base::error::{ErrorCode, ReductError};
 use reqwest::header::HeaderValue;
 use reqwest::{Method, RequestBuilder, Response, Url};
+use std::collections::HashSet;
 use tokio::sync::RwLock;
 
 /// Internal HTTP client to wrap reqwest.
@@ -16,6 +18,7 @@ pub(crate) struct HttpClient {
     base_url: Url,
     api_token: String,
     api_version: RwLock<Option<Version>>,
+    api_features: RwLock<Option<HashSet<String>>>,
     client: reqwest::Client,
 }
 
@@ -25,6 +28,7 @@ impl HttpClient {
             base_url: Url::parse(base_url)?,
             api_token: format!("Bearer {}", api_token),
             api_version: RwLock::new(None),
+            api_features: RwLock::new(None),
             client,
         })
     }
@@ -107,6 +111,7 @@ impl HttpClient {
     pub async fn send_request(&self, request: RequestBuilder) -> Result<Response> {
         let response = match request.send().await {
             Ok(response) => {
+                self.record_api_features(&response).await;
                 if response.status().is_success() {
                     *self.api_version.write().await =
                         Some(Self::check_server_api_version(&response)?);
@@ -132,6 +137,37 @@ impl HttpClient {
     pub async fn get_api_version(&self) -> Option<Version> {
         let api_version = self.api_version.read().await;
         api_version.clone()
+    }
+
+    /// Whether the server advertises an optional protocol feature. `None` until a
+    /// response has been seen; a server older than the header answers `Some(false)`.
+    pub async fn supports(&self, feature: &str) -> Option<bool> {
+        let features = self.api_features.read().await;
+        features.as_ref().map(|features| features.contains(feature))
+    }
+
+    /// Read from any response, success or error, so a fallback costs at most the one
+    /// request that discovered the server cannot do it.
+    async fn record_api_features(&self, response: &Response) {
+        if response.headers().get("x-reduct-api").is_none() {
+            return;
+        }
+
+        let features = response
+            .headers()
+            .get(API_FEATURES_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|feature| !feature.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        *self.api_features.write().await = Some(features);
     }
 
     fn check_server_api_version(response: &Response) -> Result<Version> {

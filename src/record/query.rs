@@ -4,6 +4,7 @@
 //    file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::http_client::{map_error, HttpClient};
+use crate::record::read_stream::decode_record_stream;
 use crate::record::{from_system_time, Record};
 use crate::RecordStream;
 use async_channel::{unbounded, Receiver};
@@ -13,6 +14,7 @@ use bytes::BytesMut;
 use futures::Stream;
 use futures_util::{pin_mut, StreamExt};
 use reduct_base::batch::v2::{parse_batched_headers, EntryRecordHeader};
+use reduct_base::batch::v3::{READ_STREAM_FEATURE, STREAM_CONTENT_TYPE};
 use reduct_base::batch::{parse_batched_header, sort_headers_by_time, RecordHeader};
 use reduct_base::error::ErrorCode::Unknown;
 use reduct_base::error::{ErrorCode, ReductError};
@@ -33,6 +35,7 @@ pub struct QueryBuilder {
     bucket: String,
     entries: Vec<String>,
     client: Arc<HttpClient>,
+    stream_reads: bool,
 }
 
 impl QueryBuilder {
@@ -42,7 +45,16 @@ impl QueryBuilder {
             bucket,
             entries,
             client,
+            stream_reads: true,
         }
+    }
+
+    /// Read the whole query over one response instead of one response per batch.
+    /// Ignored by a server that does not support it.
+    /// default: true
+    pub fn stream_reads(mut self, stream_reads: bool) -> Self {
+        self.stream_reads = stream_reads;
+        self
     }
 
     /// Set the start time of the query.
@@ -113,6 +125,15 @@ impl QueryBuilder {
     pub async fn send(
         self,
     ) -> Result<impl Stream<Item = Result<Record, ReductError>>, ReductError> {
+        if self.stream_reads && self.client.supports(READ_STREAM_FEATURE).await != Some(false) {
+            match self.query_v3().await {
+                Ok(stream) => return Ok(stream),
+                // An older build with no /stream route; later queries skip straight to v1.
+                Err(_) if self.client.supports(READ_STREAM_FEATURE).await == Some(false) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
         if self.entries.len() == 1 {
             self.query_v1().await
         } else {
@@ -127,6 +148,37 @@ impl QueryBuilder {
 
             self.query_v2().await
         }
+    }
+
+    async fn query_v3(&self) -> Result<QueryStream, ReductError> {
+        let query = QueryEntry {
+            query_type: QueryType::Query,
+            entries: Some(self.entries.clone()),
+            ..self.query.clone()
+        };
+
+        let request = self
+            .client
+            .request(Method::POST, &format!("/io/{}/stream", self.bucket))
+            .json(&query);
+        let response = self.client.send_request(request).await?;
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if content_type != STREAM_CONTENT_TYPE {
+            return Err(ReductError::new(
+                ErrorCode::Unknown,
+                &format!(
+                    "Expected a {} response, got {}",
+                    STREAM_CONTENT_TYPE, content_type
+                ),
+            ));
+        }
+
+        Ok(Box::pin(decode_record_stream(response)))
     }
 
     async fn query_v1(mut self) -> Result<QueryStream, ReductError> {
@@ -462,4 +514,148 @@ async fn parse_batched_records_from_headers(
             }, last));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::tests::client;
+    use crate::{Bucket, ReductClient};
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use rstest::*;
+
+    async fn collect(
+        stream: impl Stream<Item = Result<Record, ReductError>>,
+    ) -> Vec<(String, u64, Vec<u8>)> {
+        futures_util::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(record) = stream.next().await {
+            let record = record.unwrap();
+            let entry = record.entry().to_string();
+            let timestamp = record.timestamp_us();
+            out.push((entry, timestamp, record.bytes().await.unwrap().to_vec()));
+        }
+        out
+    }
+
+    async fn fill(bucket: &Bucket, entry: &str, count: u64) {
+        let mut batch = bucket.write_batch(entry);
+        for index in 0..count {
+            batch = batch.add_record(
+                Record::builder()
+                    .timestamp_us(10_000 + index)
+                    .content_type("application/cbor")
+                    .add_label("source", "test")
+                    .data(Bytes::from(format!("payload-{index}")))
+                    .build(),
+            );
+            if index % 50 == 49 {
+                assert!(batch.send().await.unwrap().is_empty());
+                batch = bucket.write_batch(entry);
+            }
+        }
+        assert!(batch.send().await.unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn streaming_and_batched_reads_agree(#[future] client: ReductClient) {
+        let bucket = client.await.get_bucket("test-bucket-1").await.unwrap();
+
+        let streamed = collect(bucket.query("entry-2").send().await.unwrap()).await;
+        let batched = collect(
+            bucket
+                .query("entry-2")
+                .stream_reads(false)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(streamed, batched);
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed[0].2, b"Hey entry-2!");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_stream_carries_more_records_than_a_batch_can(#[future] client: ReductClient) {
+        let bucket = client.await.get_bucket("test-bucket-1").await.unwrap();
+        fill(&bucket, "entry-bulk", 300).await;
+
+        let streamed = collect(bucket.query("entry-bulk").send().await.unwrap()).await;
+
+        assert_eq!(streamed.len(), 300, "one response carried the whole query");
+        assert_eq!(streamed[299].2, b"payload-299");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_multi_entry_stream_names_each_record_s_entry(#[future] client: ReductClient) {
+        let bucket = client.await.get_bucket("test-bucket-1").await.unwrap();
+
+        let records = collect(
+            bucket
+                .query(&["entry-1", "entry-2"][..])
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let mut entries: Vec<&str> = records.iter().map(|(entry, _, _)| entry.as_str()).collect();
+        entries.sort();
+        entries.dedup();
+        assert_eq!(entries, vec!["entry-1", "entry-2"]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_head_only_stream_carries_metadata_without_payloads(#[future] client: ReductClient) {
+        let bucket = client.await.get_bucket("test-bucket-1").await.unwrap();
+
+        let stream = bucket
+            .query("entry-2")
+            .head_only(true)
+            .send()
+            .await
+            .unwrap();
+        futures_util::pin_mut!(stream);
+
+        let mut seen = 0;
+        while let Some(record) = stream.next().await {
+            let record = record.unwrap();
+            assert!(record.content_length() > 0);
+            assert!(record.bytes().await.unwrap().is_empty());
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn the_client_learns_whether_the_server_streams(#[future] client: ReductClient) {
+        let client = client.await;
+        assert_eq!(
+            client.supports_streaming_reads().await,
+            Some(true),
+            "the fixture's requests should already have taught the client this"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_stream_keeps_labels_and_content_type(#[future] client: ReductClient) {
+        let bucket = client.await.get_bucket("test-bucket-1").await.unwrap();
+
+        let stream = bucket.query("entry-1").send().await.unwrap();
+        futures_util::pin_mut!(stream);
+        let record = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(record.content_type(), "text/plain");
+        assert_eq!(record.labels()["entry"], "1");
+        assert_eq!(record.labels()["bucket"], "1");
+    }
 }
